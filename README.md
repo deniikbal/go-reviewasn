@@ -53,39 +53,51 @@ sudo apt update && sudo apt install -y google-chrome-stable
 google-chrome --version
 ```
 
-### 2. Build aplikasi
+### 2. Install Go di VPS
 
-Di PC Windows (cross-compile ke Linux):
+Jangan pakai `apt install golang-go` (versinya terlalu tua — proyek ini butuh Go 1.26). Install manual:
 
 ```bash
-set GOOS=linux
-set GOARCH=amd64
+wget https://go.dev/dl/go1.26.0.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.26.0.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+
+# verifikasi
+go version   # harus go1.26.0 atau lebih baru
+```
+
+### 3. Upload source code ke VPS
+
+Dari PC Windows (Git Bash), upload folder proyek:
+
+```bash
+scp main.go qr.go server.go telegram.go go.mod go.sum root@IP_VPS:/opt/reviewasn/
+scp -r ui root@IP_VPS:/opt/reviewasn/
+scp .env.example root@IP_VPS:/opt/reviewasn/
+```
+
+### 4. Build di VPS
+
+```bash
+cd /opt/reviewasn
 go build -o reviewasn .
-```
-
-Atau di Git Bash / Linux:
-
-```bash
-GOOS=linux GOARCH=amd64 go build -o reviewasn .
-```
-
-### 3. Upload ke VPS
-
-```bash
-scp reviewasn .env.example root@IP_VPS:/opt/reviewasn/
 ```
 
 Struktur folder di VPS:
 
 ```
 /opt/reviewasn/
-├── reviewasn        # binary
+├── reviewasn        # hasil build
+├── main.go qr.go server.go telegram.go
+├── go.mod go.sum
+├── ui/
 ├── .env             # konfigurasi (isi dulu!)
-├── akun.json        # dibuat otomatis / salin dari PC
-└── ui/              # opsional — UI sudah di-embed ke binary
+└── akun.json        # dibuat otomatis / salin dari PC
 ```
 
-### 4. Jalankan
+### 5. Jalankan
 
 ```bash
 cd /opt/reviewasn
@@ -100,7 +112,7 @@ REVIEW_HEADLESS=1 ./reviewasn --all
 
 Akses web UI: `http://IP_VPS:2323`
 
-### 5. Jalankan sebagai service (systemd)
+### 6. Jalankan sebagai service (systemd)
 
 Supaya tetap hidup setelah VPS di-restart / sesi SSH ditutup:
 
