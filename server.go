@@ -2,12 +2,13 @@ package main
 
 // Mode --server: web UI satu halaman (di-embed) + API untuk:
 //   - kelola akun (CRUD, tersimpan di akun.json seperti biasa)
+//   - bisa digabung bot Telegram via mode --all (go telegramMain() di main.go)
 //   - jalankan review (headless di VPS / headful di PC) untuk akun terpilih
 //   - log live via SSE
 //   - kode MFA live per akun
 //   - upload gambar QR -> scan -> simpan secret
 //
-// Jalankan: ReviewASN.exe --server [--headless] [--port 8080]
+// Jalankan: ReviewASN.exe --server [--headless] [--port 2323]
 
 import (
 	"embed"
@@ -390,7 +391,7 @@ func apiLog(w http.ResponseWriter, r *http.Request) {
 // ---------- server utama ----------
 
 func serverMain() {
-	port := "8080"
+	port := "2323"
 	for i, a := range os.Args[1:] {
 		if a == "--port" && i+1 < len(os.Args)-1 {
 			port = os.Args[i+2]

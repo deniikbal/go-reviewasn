@@ -1,0 +1,12 @@
+# binary
+ReviewASN.exe
+*.exe
+
+# kredensial - JANGAN di-commit
+.env
+akun.json
+telegram.json
+
+# output runtime
+debug*.png
+qr/

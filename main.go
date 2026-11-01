@@ -67,8 +67,39 @@ func init() {
 	}
 	BASE_DIR = filepath.Dir(exe)
 	CONFIG_PATH = filepath.Join(BASE_DIR, "akun.json")
+	muatEnv()
 	// Buat konsol tetap tampil saat double-click exe di Windows (rod/leakless
 	// sudah menangani ini; exe Go biasa tidak detach console).
+}
+
+// muatEnv: baca file .env di samping exe (format KEY=VALUE per baris,
+// baris kosong & awalan # diabaikan) lalu set sebagai environment variable.
+// Variabel yang SUDAH ada di environment tidak ditimpa (env sistem menang).
+// Dipakai untuk: TELEGRAM_TOKEN, TG_IZIN, REVIEW_HEADLESS.
+func muatEnv() {
+	data, err := os.ReadFile(filepath.Join(BASE_DIR, ".env"))
+	if err != nil {
+		return // .env tidak ada, tidak masalah
+	}
+	for _, baris := range strings.Split(string(data), "\n") {
+		baris = strings.TrimSpace(baris)
+		if baris == "" || strings.HasPrefix(baris, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(baris, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		// buang tanda kutip pembungkus opsional
+		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+		if _, sudah := os.LookupEnv(k); !sudah && k != "" {
+			_ = os.Setenv(k, v)
+		}
+	}
 }
 
 func bacaConfig() Config {
@@ -922,6 +953,12 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "--server":
+			serverMain()
+			return
+		case "--all":
+			// Server web + bot Telegram dalam satu proses.
+			// Bot jalan di background, web server blocking di foreground.
+			go telegramMain()
 			serverMain()
 			return
 		case "--telegram":

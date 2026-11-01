@@ -2,7 +2,9 @@ package main
 
 // Mode --telegram: bot Telegram untuk mengelola ReviewASN dari jarak jauh.
 //
-// Alur user (per user Telegram, tersimpan di telegram.json):
+// Jalankan via: ReviewASN.exe --telegram (token via env TELEGRAM_TOKEN atau --token)
+// atau gabung dengan web server: ReviewASN.exe --all
+// Sesi pendaftaran per user disimpan di memori (tidak di file).
 //   1. /start  -> bot minta NIP
 //   2. user ketik NIP            -> disimpan
 //   3. bot minta password        -> disimpan
@@ -21,7 +23,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -312,5 +313,3 @@ func httpGet(url string) ([]byte, error) {
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
 }
-
-var _ = filepath.Join // jaga import
