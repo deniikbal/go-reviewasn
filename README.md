@@ -14,6 +14,8 @@ Login otomatis (NIP + password + MFA/TOTP), membuka halaman Kinerja, mengambil k
 | Telegram | `ReviewASN --telegram` | Bot Telegram: daftar akun, jalankan review, lihat status & kode MFA |
 | QR MFA | `ReviewASN --qr` | Scan QR TOTP dari screenshot di folder `qr/`, tampilkan kode 6 digit live |
 | Cek mandiri | `ReviewASN --cek` | Cek Chrome, config, dan kesiapan aplikasi |
+| Cek alur | `ReviewASN --cek-alur` | Uji login → buka Kinerja → baca daftar review **tanpa** menyimpan review |
+| Diagnosa | `ReviewASN --probe` | Buang struktur DOM dashboard SSO ke `probe_*.json` (debug) |
 | Kelola akun | `ReviewASN --akun` | Tambah/hapus akun via terminal |
 
 Flag tambahan:

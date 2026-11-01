@@ -29,7 +29,68 @@ import (
 	"time"
 
 	tg "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 )
+
+// ---------- output log ----------
+
+func p(a ...interface{}) {
+	fmt.Println(a...)
+}
+
+func pf(format string, a ...interface{}) {
+	fmt.Printf(format, a...)
+}
+
+// ---------- status run ----------
+
+var (
+	runMu       sync.Mutex
+	sedangJalan bool
+	runInfo     string
+)
+
+// jalankanReview: seperti jalankan() tapi headless selalu (untuk bot/VPS)
+// dan tanpa wizard.
+func jalankanReview(daftar []Akun) {
+	TAHUN = bacaConfig().Tahun
+	JEDA_DASHBOARD = bacaConfig().JedaDashboard
+
+	u := launcher.New().
+		Set("incognito").
+		Set("disable-popup-blocking").
+		Set("no-sandbox"). // penting di VPS (root/container)
+		Set("lang", "id-ID").
+		Headless(true).
+		MustLaunch()
+
+	browser := rod.New().ControlURL(u).MustConnect()
+	defer browser.MustClose()
+	_ = proto.NetworkClearBrowserCookies{}.Call(browser)
+
+	for i, akun := range daftar {
+		pf("\n========== AKUN %d/%d: %s ==========\n", i+1, len(daftar), akun.NIP)
+		halaman := browser.MustPages()
+		var page *rod.Page
+		if len(halaman) > 0 {
+			page = halaman[0]
+			for _, t := range halaman[1:] {
+				_ = t.Close()
+			}
+			_ = page.Navigate("about:blank")
+		} else {
+			page = browser.MustPage("about:blank")
+		}
+		_, _ = page.EvalOnNewDocument(jsTangkapOpen)
+
+		if err := satuAkun(page, browser, akun); err != nil {
+			pf("ERROR akun %s: %v\n", akun.NIP, err)
+			screenshotDebug(page, fmt.Sprintf("debug_%s.png", akun.NIP))
+		}
+	}
+}
 
 // ---------- sesi pendaftaran per user ----------
 
@@ -110,22 +171,89 @@ func telegramMain() {
 	bot.Debug = false
 	pf("Bot Telegram aktif sebagai @%s\n", bot.Self.UserName)
 
-	u := tg.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
+	// Telegram hanya mengizinkan SATU proses memanggil getUpdates. Kalau masih
+	// ada instance lain (mis. jendela ReviewASN lama belum tertutup), Telegram
+	// membalas 409 Conflict dan tgbotapi akan spam "Conflict: terminated by
+	// other getUpdates request" tiap ~40 detik. Di sini kita kelola sendiri:
+	// tunggu sampai token bebas, lalu beri pesan yang jelas.
+	if !tungguTelegramBebas(bot) {
+		p("PERINGATAN: token bot masih dipakai proses lain.")
+		p("            Bot tetap dicoba, tapi tutup dulu ReviewASN lain agar jalan.")
+	}
 
-	for up := range updates {
-		if up.Message != nil {
-			if !boleh(up.Message.Chat.ID) {
+	// GetUpdates manual (bukan GetUpdatesChan) supaya conflict bisa dibedakan
+	// dari gangguan jaringan dan log tidak dibanjiri pesan library.
+	offset := 0
+	for {
+		cfg := tg.NewUpdate(offset)
+		cfg.Timeout = 60
+		cfg.Limit = 100
+		ups, err := bot.GetUpdates(cfg)
+		if err != nil {
+			if galatKonflik(err) {
+				p("Telegram: instance lain memakai token bot ini, tunggu 10 detik...")
+				time.Sleep(10 * time.Second)
 				continue
 			}
-			prosesPesan(bot, up.Message)
-		} else if up.CallbackQuery != nil {
-			if !boleh(up.CallbackQuery.Message.Chat.ID) {
-				continue
-			}
-			prosesTombol(bot, up.CallbackQuery)
+			pf("Telegram: %v (coba lagi 3 detik)\n", err)
+			time.Sleep(3 * time.Second)
+			continue
 		}
+		for _, up := range ups {
+			if up.UpdateID >= offset {
+				offset = up.UpdateID + 1
+			}
+			if up.Message != nil {
+				if !boleh(up.Message.Chat.ID) {
+					continue
+				}
+				// Foto = QR TOTP (langkah terakhir pendaftaran akun).
+				if len(up.Message.Photo) > 0 {
+					prosesFoto(bot, up.Message)
+					continue
+				}
+				prosesPesan(bot, up.Message)
+			} else if up.CallbackQuery != nil {
+				if !boleh(up.CallbackQuery.Message.Chat.ID) {
+					continue
+				}
+				prosesTombol(bot, up.CallbackQuery)
+			}
+		}
+	}
+}
+
+// galatKonflik: deteksi balasan 409 Conflict dari Telegram.
+func galatKonflik(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "conflict") || strings.Contains(s, "409") ||
+		strings.Contains(s, "terminated by other getupdates")
+}
+
+// tungguTelegramBebas: panggil getUpdates sekali dengan offset -1 (sekalian
+// membuang pesan lama yang menumpuk) sampai token tidak dipakai proses lain.
+func tungguTelegramBebas(bot *tg.BotAPI) bool {
+	batas := time.Now().Add(30 * time.Second)
+	for {
+		cfg := tg.NewUpdate(-1)
+		cfg.Timeout = 0
+		cfg.Limit = 1
+		_, err := bot.GetUpdates(cfg)
+		if err == nil {
+			return true
+		}
+		if !galatKonflik(err) {
+			pf("Telegram: %v\n", err)
+			return false
+		}
+		if time.Now().After(batas) {
+			return false
+		}
+		p("Telegram: token masih dipakai instance lain, menunggu...")
+		time.Sleep(3 * time.Second)
 	}
 }
 
@@ -139,6 +267,38 @@ func prosesPesan(bot *tg.BotAPI, m *tg.Message) {
 	case "start":
 		if tgSedangJalan() {
 			balas(bot, m.Chat.ID, "⏳ Review sedang berjalan. Tunggu sampai selesai.")
+			return
+		}
+		s.Step = ""
+		// Cek: kalau NIP ini sudah pernah didaftarkan, tidak perlu input ulang.
+		nip := strings.TrimSpace(m.CommandArguments())
+		cfg := bacaConfig()
+		if nip != "" {
+			// /start 198711... -> langsung cek NIP spesifik
+			for _, a := range cfg.Akun {
+				if a.NIP == nip && a.Secret != "" {
+					balasTombol(bot, m.Chat.ID,
+						fmt.Sprintf("✅ Akun %s sudah terdaftar.\nKode MFA sekarang: %s\n\nTinggal jalankan review — tidak perlu input ulang.",
+							nip, kodeTOTP(a.Secret)))
+					return
+				}
+			}
+			// NIP belum ada -> mulai pendaftaran dari password
+			s.Nip = nip
+			s.Step = "pass"
+			balas(bot, m.Chat.ID, "NIP baru terdeteksi. Kirim password SMARTASN untuk "+nip+":")
+			return
+		}
+		if len(cfg.Akun) > 0 {
+			// Sudah ada akun tersimpan: langsung pakai, tanpa input ulang.
+			daftar := ""
+			for _, a := range cfg.Akun {
+				daftar += "• " + a.NIP + "\n"
+			}
+			balasTombol(bot, m.Chat.ID,
+				"👋 Selamat datang kembali! Akun tersimpan:\n"+daftar+
+					"\nTinggal klik ▶ Jalankan Review — tidak perlu input NIP/password/QR lagi.\n"+
+					"(Untuk daftar ulang akun, kirim NIP-nya langsung)")
 			return
 		}
 		s.Step = "nip"
@@ -158,6 +318,44 @@ func prosesPesan(bot *tg.BotAPI, m *tg.Message) {
 		s.Step = ""
 		balas(bot, m.Chat.ID, "Pendaftaran dibatalkan.")
 		return
+	case "hapus":
+		nip := strings.TrimSpace(m.CommandArguments())
+		cfg := bacaConfig()
+		baruDihapus := false
+		akunBaru := []Akun{}
+		for _, a := range cfg.Akun {
+			if nip != "" && a.NIP == nip || (nip == "" && len(cfg.Akun) == 1) {
+				baruDihapus = true
+				continue
+			}
+			akunBaru = append(akunBaru, a)
+		}
+		if baruDihapus {
+			cfg.Akun = akunBaru
+			simpanConfig(cfg)
+			balas(bot, m.Chat.ID, "🗑 Akun "+nip+" dihapus. Kirim NIP baru untuk daftar ulang.")
+		} else {
+			balas(bot, m.Chat.ID, "NIP tidak ditemukan. Pakai: /hapus <NIP>")
+		}
+		return
+	case "akun":
+		cfg := bacaConfig()
+		if len(cfg.Akun) == 0 {
+			balas(bot, m.Chat.ID, "Belum ada akun tersimpan. Ketik /start.")
+			return
+		}
+		daftar := "📋 Akun tersimpan:\n"
+		for _, a := range cfg.Akun {
+			daftar += "• " + a.NIP
+			if a.Secret != "" {
+				daftar += " ✅ (siap)"
+			} else {
+				daftar += " ⚠️ (secret kosong)"
+			}
+			daftar += "\n"
+		}
+		balas(bot, m.Chat.ID, daftar+"\nDaftar ulang: kirim NIP-nya langsung.\nHapus: /hapus <NIP>")
+		return
 	}
 
 	// Alur pendaftaran
@@ -167,6 +365,17 @@ func prosesPesan(bot *tg.BotAPI, m *tg.Message) {
 		if len(nip) < 8 {
 			balas(bot, m.Chat.ID, "NIP sepertinya salah, coba lagi:")
 			return
+		}
+		// NIP sudah pernah didaftarkan? Langsung pakai, tanpa input ulang.
+		cfg := bacaConfig()
+		for _, a := range cfg.Akun {
+			if a.NIP == nip && a.Secret != "" {
+				s.Step = ""
+				balasTombol(bot, m.Chat.ID,
+					fmt.Sprintf("✅ Akun %s sudah terdaftar.\nKode MFA sekarang: %s\n\nTinggal klik ▶ Jalankan Review.",
+						nip, kodeTOTP(a.Secret)))
+				return
+			}
 		}
 		s.Nip = nip
 		s.Step = "pass"
@@ -178,6 +387,24 @@ func prosesPesan(bot *tg.BotAPI, m *tg.Message) {
 			"Password ✓\nTerakhir: kirim FOTO QR TOTP-nya.\n"+
 				"(Dari authenticator: Transfer akun → Ekspor → screenshot)")
 	case "":
+		// Bukan perintah & tidak sedang mendaftar: kalau teksnya NIP yang sudah
+		// terdaftar, langsung pakai; kalau terlihat seperti NIP baru, mulai daftar.
+		teks := strings.TrimSpace(m.Text)
+		cfg := bacaConfig()
+		for _, a := range cfg.Akun {
+			if a.NIP == teks && a.Secret != "" {
+				balasTombol(bot, m.Chat.ID,
+					fmt.Sprintf("✅ Akun %s sudah terdaftar.\nKode MFA sekarang: %s\n\nTinggal klik ▶ Jalankan Review.",
+						teks, kodeTOTP(a.Secret)))
+				return
+			}
+		}
+		if len(teks) >= 8 && hanyaAngka(teks) {
+			s.Step = "nip" // jalankan alur pendaftaran: akan dicek, kalau NIP
+			// sudah terdaftar langsung dipakai tanpa password/QR.
+			prosesPesan(bot, m)
+			return
+		}
 		balas(bot, m.Chat.ID, "Ketik /start untuk mulai.")
 	}
 }
@@ -253,7 +480,7 @@ func prosesTombol(bot *tg.BotAPI, cq *tg.CallbackQuery) {
 		balas(bot, cq.Message.Chat.ID, fmt.Sprintf("▶ Menjalankan review untuk %d akun...", len(cfg.Akun)))
 		go func() {
 			defer tgSetRun(false, "Selesai.")
-			jalankanServer(cfg.Akun, true) // selalu headless
+			jalankanReview(cfg.Akun) // selalu headless
 		}()
 	case "mfa":
 		cfg := bacaConfig()
@@ -303,6 +530,19 @@ func balasTombol(bot *tg.BotAPI, chat int64, teks string) {
 		),
 	)
 	_, _ = bot.Send(msg)
+}
+
+// hanyaAngka: true kalau string terdiri dari digit saja.
+func hanyaAngka(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func httpGet(url string) ([]byte, error) {

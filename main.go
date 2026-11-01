@@ -346,6 +346,9 @@ func screenshotDebug(page *rod.Page, nama string) {
 	if page == nil {
 		return
 	}
+	// page bisa saja sudah "mati" (target di-swap Chrome saat navigasi
+	// lintas-origin). Jangan sampai proses utama ikut panic.
+	defer func() { _ = recover() }()
 	opt := &proto.PageCaptureScreenshot{}
 	img, err := page.Screenshot(false, opt)
 	if err == nil {
@@ -354,6 +357,39 @@ func screenshotDebug(page *rod.Page, nama string) {
 			pf("      Screenshot disimpan: %s\n", nama)
 		}
 	}
+}
+
+// urlHalaman: MustInfo() melempar panic kalau target halaman sudah tidak ada
+// (Chrome mengganti target saat navigasi lintas-origin, mis. SSO -> dashboard).
+// Semua pemakaian URL halaman di aplikasi ini harus lewat sini.
+func urlHalaman(p *rod.Page) (u string) {
+	if p == nil {
+		return ""
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			u = ""
+		}
+	}()
+	return p.MustInfo().URL
+}
+
+// halamanHidup: kembalikan handle tab yang masih valid. Dipakai setelah login
+// karena handle lama bisa mati walau browsernya sehat.
+func halamanHidup(browser *rod.Browser, page *rod.Page) *rod.Page {
+	if urlHalaman(page) != "" {
+		return page
+	}
+	ps := browser.MustPages()
+	for i := len(ps) - 1; i >= 0; i-- {
+		if urlHalaman(ps[i]) != "" && urlHalaman(ps[i]) != "about:blank" {
+			return ps[i]
+		}
+	}
+	if len(ps) > 0 {
+		return ps[len(ps)-1]
+	}
+	return browser.MustPage("about:blank")
 }
 
 // =============================================
@@ -381,7 +417,7 @@ func login(page *rod.Page) error {
 	// Bisa jadi langsung sukses (tanpa MFA) atau masuk halaman MFA.
 	p("[2/5] Masukkan kode MFA...")
 	for i := 0; i < 15; i++ {
-		if strings.Contains(page.MustInfo().URL, "kinerja") {
+		if strings.Contains(urlHalaman(page), "kinerja") {
 			p("      Tidak butuh MFA, langsung masuk.")
 			return nil
 		}
@@ -444,7 +480,7 @@ func cariTabKinerja(browser *rod.Browser, timeout time.Duration) *rod.Page {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for _, p := range browser.MustPages() {
-			if diKinerja(p.MustInfo().URL) {
+			if diKinerja(urlHalaman(p)) {
 				return p
 			}
 		}
@@ -475,7 +511,14 @@ func klikBukaAplikasi(page *rod.Page, timeout time.Duration) bool {
 			txt, _ := el.Text()
 			if strings.Contains(strings.TrimSpace(txt), t) {
 				if vis, _ := el.Visible(); vis {
+					// Coba klik mouse biasa dulu.
 					if el.Click(proto.InputMouseButtonLeft, 1) == nil {
+						return true
+					}
+					// Fallback: klik via JS (window.open bisa terblokir,
+					// tapi URL tetap tertangkap oleh jsTangkapOpen).
+					if res, err := el.Evaluate(rod.Eval(`() => this.click()`)); err == nil {
+						_ = res
 						return true
 					}
 				}
@@ -495,7 +538,7 @@ func urlOpenTertangkap(page *rod.Page) string {
 
 func layakDibuka(u string, page *rod.Page) bool {
 	return u != "" && (strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")) &&
-		strings.Contains(u, "kinerja") && !diKinerja(page.MustInfo().URL)
+		strings.Contains(u, "kinerja") && !diKinerja(urlHalaman(page))
 }
 
 func bukaURLDiTab(browser *rod.Browser, rawurl string) {
@@ -510,62 +553,144 @@ func bukaURLDiTab(browser *rod.Browser, rawurl string) {
 	stabil(tab, 2*time.Second)
 }
 
+// jsKlikKartuKinerja: klik KARTU layanan "Kinerja" di dashboard SMARTASN.
+//
+// Dashboard punya dua elemen berteks "Kinerja":
+//  1. <button>Kinerja</button> di navbar -> hanya membuka dropdown, tidak
+//     pernah memunculkan modal tahun dan tidak pernah membuka aplikasi.
+//  2. kartu di "Layanan Unggulan" dengan teks gabungan
+//     "Kinerja Kinerja Pegawai" -> inilah pintu masuk aplikasi Kinerja.
+//
+// Versi lama mencari teks PERSIS "Kinerja" sehingga selalu kena tombol navbar.
+// Sekarang: cari elemen terkecil (paling dalam) yang memuat "Kinerja Pegawai",
+// abaikan header/nav, lalu klik.
+const jsKlikKartuKinerja = `
+(target) => {
+	const norm = s => (s || "").replace(/\s+/g, " ").trim();
+	const kandidat = [...document.querySelectorAll("button,a,[role='button'],div")].filter(e => {
+		const t = norm(e.innerText);
+		if (!t) return false;
+		const r = e.getBoundingClientRect();
+		if (r.width === 0 || r.height === 0) return false;
+		if (e.closest("header,nav")) return false;
+		if (target === "Kinerja Pegawai") return t.includes("Kinerja Pegawai");
+		return t.startsWith("Kinerja") && t.length <= 40;
+	});
+	if (!kandidat.length) return null;
+	kandidat.sort((a, b) => {
+		const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+		return ra.width * ra.height - rb.width * rb.height;
+	});
+	const el = kandidat[0];
+	el.scrollIntoView({ block: "center" });
+	el.click();
+	return norm(el.innerText).slice(0, 60);
+}
+`
+
 func klikCardKinerja(page *rod.Page) bool {
-	// Klik card "Kinerja" di dashboard SSO: cari elemen yang teksnya persis
-	// "Kinerja" di antara card aplikasi.
-	els, err := page.Timeout(10 * time.Second).Elements("a, button, div")
-	if err != nil {
-		return false
-	}
-	for _, el := range els {
-		txt, _ := el.Text()
-		txt = strings.TrimSpace(txt)
-		if txt == "Kinerja" {
-			if vis, _ := el.Visible(); vis {
-				if el.Click(proto.InputMouseButtonLeft, 1) == nil {
-					return true
-				}
+	// Dashboard Vue butuh beberapa detik untuk render; kalau diklik terlalu
+	// cepat, elemennya belum ada dan klik gagal tanpa error.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, target := range []string{"Kinerja Pegawai", "Kinerja"} {
+			res, err := page.Evaluate(rod.Eval(jsKlikKartuKinerja, target))
+			if err == nil && res.Value.Val() != nil {
+				pf("      Kartu diklik: %q\n", res.Value.Str())
+				return true
 			}
 		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	return false
 }
 
-func pilihTahun(page *rod.Page) {
-	stabil(page, 1*time.Second)
-	// Modal pilih tahun: pilih tahun TAHUN lalu klik "Lanjutkan"
-	els, _ := page.Timeout(5 * time.Second).Elements("button, a, div, span, label, li")
-	for _, el := range els {
-		txt, _ := el.Text()
-		txt = strings.TrimSpace(txt)
-		if txt == TAHUN {
-			if vis, _ := el.Visible(); vis {
-				_ = el.Click(proto.InputMouseButtonLeft, 1)
-				break
-			}
-		}
+// pilihTahun: modal "Pilih Tahun Kinerja" -> pilih tahun -> klik
+// "Lanjutkan ke Kinerja". Tombol ini yang membuka tab autologin Kinerja.
+//
+// Dua jebakan yang diperbaiki:
+//   - Radio-nya berlabel "Tahun 2026" (bukan "2026"), jadi pencarian teks
+//     persis "2026" tidak pernah kena dan tahun tidak pernah terpilih.
+//   - Modal harus ditunggu dulu; versi lama langsung memindai halaman.
+func pilihTahun(page *rod.Page) bool {
+	if _, err := page.Timeout(12*time.Second).Element("input[name='tahun']"); err != nil {
+		return false
 	}
-	time.Sleep(500 * time.Millisecond)
-	// tombol Lanjutkan
-	klikPertamaTerlihat(page, "button:contains('Lanjutkan')", 2*time.Second)
-	// Rod selector :contains tidak ada bawaan; pakai scan manual
-	els, _ = page.Elements("button")
-	for _, el := range els {
-		txt, _ := el.Text()
-		if strings.Contains(strings.TrimSpace(txt), "Lanjutkan") {
-			if vis, _ := el.Visible(); vis {
-				_ = el.Click(proto.InputMouseButtonLeft, 1)
-			}
-			break
-		}
+	stabil(page, 500*time.Millisecond)
+
+	res, err := page.Evaluate(rod.Eval(`(tahun) => {
+		const r = document.querySelector("input[name='tahun'][value='" + tahun + "']");
+		if (!r) return false;
+		if (!r.checked) r.click();
+		return r.checked;
+	}`, TAHUN))
+	if err != nil || !res.Value.Bool() {
+		pf("      Tahun %s tidak ada di modal, pakai pilihan default.\n", TAHUN)
 	}
-	stabil(page, 2*time.Second)
+	time.Sleep(300 * time.Millisecond)
+
+	res, err = page.Evaluate(rod.Eval(`() => {
+		const btn = [...document.querySelectorAll("button")].find(b => {
+			const t = (b.innerText || "").trim();
+			const r = b.getBoundingClientRect();
+			return r.width > 0 && r.height > 0 && t.includes("Lanjutkan");
+		});
+		if (!btn) return false;
+		btn.click();
+		return true;
+	}`))
+	if err != nil {
+		return false
+	}
+	return res.Value.Bool()
 }
 
 func bukaKinerja(page *rod.Page, browser *rod.Browser) (*rod.Page, error) {
 	tMulai := time.Now()
 	p("[3/5] Masuk dashboard SSO, buka Kinerja...")
 
+	// Handle halaman bisa mati setelah login (Chrome mengganti target saat
+	// navigasi lintas-origin SSO), jadi ambil ulang tab yang masih hidup.
+	page = halamanHidup(browser, page)
+
+	// ALUR BARU: setelah login mendarat di
+	// https://smartasn.jabarprov.go.id/framer/kinerja?tahun=2026 yang
+	// berisi tombol "Buka Aplikasi Sekarang". Tombol itu membuka TAB BARU
+	// ke https://kinerja.jabarprov.go.id/kinerjajabar/dashboard.
+	if strings.Contains(urlHalaman(page), "framer/kinerja") {
+		p("      Halaman framer terdeteksi, klik 'Buka Aplikasi Sekarang'...")
+		if klikBukaAplikasi(page, 20*time.Second) {
+			tab := cariTabKinerja(browser, 30*time.Second)
+			if tab != nil {
+				stabil(tab, 3*time.Second)
+				pf("[4/5] Masuk ke aplikasi Kinerja (%.1fs): %s\n", time.Since(tMulai).Seconds(), urlHalaman(tab))
+				return tab, nil
+			}
+			// Klik berhasil tapi tab baru tidak terdeteksi: coba fallback di bawah.
+		}
+		// Fallback: URL tertangkap dari window.open -> buka sendiri
+		if u := urlOpenTertangkap(page); layakDibuka(u, page) {
+			pf("      Buka URL hasil window.open: %.80s\n", u)
+			bukaURLDiTab(browser, u)
+			if tab := cariTabKinerja(browser, 25*time.Second); tab != nil {
+				stabil(tab, 3*time.Second)
+				pf("[4/5] Masuk ke aplikasi Kinerja (%.1fs): %s\n", time.Since(tMulai).Seconds(), urlHalaman(tab))
+				return tab, nil
+			}
+		}
+		// Fallback terakhir: buka langsung URL dashboard Kinerja
+		p("      Tab tidak muncul, buka langsung URL Kinerja...")
+		bukaURLDiTab(browser, BASE_URL+"/kinerjajabar/dashboard")
+		if tab := cariTabKinerja(browser, 25*time.Second); tab != nil {
+			stabil(tab, 3*time.Second)
+			pf("[4/5] Masuk ke aplikasi Kinerja (%.1fs): %s\n", time.Since(tMulai).Seconds(), urlHalaman(tab))
+			return tab, nil
+		}
+		screenshotDebug(page, "debug.png")
+		return nil, fmt.Errorf("halaman framer ada tapi tab Kinerja tidak muncul")
+	}
+
+	// ALUR LAMA (fallback): dashboard SSO dengan card Kinerja.
 	if !klikCardKinerja(page) {
 		// Fallback: langsung menuju URL kinerja (alur lama)
 		if err := page.Navigate(BASE_URL); err != nil {
@@ -604,14 +729,14 @@ func bukaKinerja(page *rod.Page, browser *rod.Browser) (*rod.Page, error) {
 
 	if tab != nil {
 		stabil(tab, 2*time.Second)
-		pf("[4/5] Masuk ke aplikasi Kinerja (%.1fs): %s\n", time.Since(tMulai).Seconds(), tab.MustInfo().URL)
+		pf("[4/5] Masuk ke aplikasi Kinerja (%.1fs): %s\n", time.Since(tMulai).Seconds(), urlHalaman(tab))
 		return tab, nil
 	}
 
 	screenshotDebug(page, "debug.png")
 	urls := []string{}
 	for _, p := range browser.MustPages() {
-		urls = append(urls, p.MustInfo().URL)
+		urls = append(urls, urlHalaman(p))
 	}
 	return nil, fmt.Errorf("tidak sampai ke aplikasi Kinerja. Tab yang ada: %v", urls)
 }
@@ -705,7 +830,7 @@ func ambilPaths(page *rod.Page) []string {
 	}
 
 	for percobaan := 0; percobaan < 3; percobaan++ {
-		if strings.Contains(page.MustInfo().URL, "review-perilaku") {
+		if strings.Contains(urlHalaman(page), "review-perilaku") {
 			break
 		}
 		// 1) Coba klik menu internal (tanpa reload)
@@ -720,10 +845,10 @@ func ambilPaths(page *rod.Page) []string {
 			p("      Pindah route via history API...")
 		}
 		stabil(page, 5 * time.Second)
-		if strings.Contains(page.MustInfo().URL, "review-perilaku") {
+		if strings.Contains(urlHalaman(page), "review-perilaku") {
 			break
 		}
-		pf("      Masih di %s, ulangi...\n", page.MustInfo().URL)
+		pf("      Masih di %s, ulangi...\n", urlHalaman(page))
 		time.Sleep(2 * time.Second)
 	}
 
@@ -856,6 +981,10 @@ func satuAkun(page *rod.Page, browser *rod.Browser, akun Akun) error {
 		time.Sleep(3 * time.Second)
 	}
 
+	// Handle tab bisa mati walau login sukses (Chrome mengganti target saat
+	// redirect lintas-origin), jadi ambil ulang tab yang masih hidup.
+	page = halamanHidup(browser, page)
+
 	page, err = bukaKinerja(page, browser) // bisa pindah tab, jadi page bisa berganti
 	if err != nil {
 		return err
@@ -950,17 +1079,11 @@ func pilihAkun(cfg Config) []Akun {
 }
 
 func main() {
+	pastikanSatuInstance()
+	go pantauKontrol()
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "--server":
-			serverMain()
-			return
-		case "--all":
-			// Server web + bot Telegram dalam satu proses.
-			// Bot jalan di background, web server blocking di foreground.
-			go telegramMain()
-			serverMain()
-			return
 		case "--telegram":
 			telegramMain()
 			return
@@ -972,6 +1095,12 @@ func main() {
 			return
 		case "--akun":
 			kelolaAkun()
+			return
+		case "--probe":
+			probe()
+			return
+		case "--cek-alur":
+			cekAlur()
 			return
 		}
 	}
@@ -1120,7 +1249,7 @@ func jalankan(daftar []Akun) {
 			}
 			screenshotDebug(tabErr, fmt.Sprintf("debug%d.png", i+1))
 			if tabErr != nil {
-				pf("URL saat error: %s\n", tabErr.MustInfo().URL)
+				pf("URL saat error: %s\n", urlHalaman(tabErr))
 			}
 		}
 	}
