@@ -75,7 +75,7 @@ func init() {
 // muatEnv: baca file .env di samping exe (format KEY=VALUE per baris,
 // baris kosong & awalan # diabaikan) lalu set sebagai environment variable.
 // Variabel yang SUDAH ada di environment tidak ditimpa (env sistem menang).
-// Dipakai untuk: TELEGRAM_TOKEN, TG_IZIN, REVIEW_HEADLESS.
+// Dipakai untuk: TELEGRAM_TOKEN, TG_IZIN.
 func muatEnv() {
 	data, err := os.ReadFile(filepath.Join(BASE_DIR, ".env"))
 	if err != nil {
