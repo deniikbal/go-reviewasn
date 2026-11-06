@@ -1,6 +1,7 @@
 # binary
 ReviewASN.exe
 *.exe
+*.exe~
 
 # kredensial - JANGAN di-commit
 .env
@@ -9,4 +10,9 @@ telegram.json
 
 # output runtime
 debug*.png
+probe*.png
+cek_*.png
+probe_*.json
+reviewasn.lock
+reviewasn.control
 qr/
